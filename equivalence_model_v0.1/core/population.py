@@ -26,9 +26,13 @@ Usage:
         recruited_mask=mask,                     # which neurons to boost
     )
 
-encode() and decode() are the single source of truth for the pipeline.
-run_trials() is a vectorised convenience wrapper that implements the same
-    logic in batch for performance (~50-100× faster than looping).
+encode() and decode() are the single source of truth for the per-trial
+pipeline at discrete grid orientations. run_trials() is a vectorised
+batch runner that draws CONTINUOUS true orientations from
+Uniform[-pi, pi) and linearly interpolates the stored tuning curves at
+those off-grid points — this avoids the error-distribution quantization
+artefact discussed in the bays_figure_2_notebook diagnostic block
+(uniq_GP / zero_GP / min|e|_GP).
 """
 
 import numpy as np
@@ -163,7 +167,56 @@ class Population:
         return f, theta_grid
 
     # ------------------------------------------------------------------
-    # Core methods — the single source of truth
+    # Helper: circular linear interpolation indices
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _circular_linear_interp_indices(theta_continuous, n_theta):
+        """
+        Bracketing-grid indices and weights for linear interpolation of a
+        function tabulated on the grid
+
+            grid = np.linspace(-pi, pi, n_theta, endpoint=False)
+
+        at continuous theta values.
+
+        For a function f tabulated on `grid`, the interpolated value at
+        theta is
+
+            f(theta) ≈ (1 - w) * f[grid[i0]] + w * f[grid[i1]]
+
+        with i1 = (i0 + 1) mod n_theta (so the interval wraps around the
+        circle from grid[n_theta-1] to grid[0]).
+
+        Parameters
+        ----------
+        theta_continuous : array-like
+            Continuous orientations in [-pi, pi). Any shape is accepted;
+            i0, i1, w are returned with the same shape.
+        n_theta : int
+            Number of grid points.
+
+        Returns
+        -------
+        i0 : np.ndarray of int
+            Left bracket grid indices.
+        i1 : np.ndarray of int
+            Right bracket grid indices, wrapped circularly.
+        w : np.ndarray of float
+            Interpolation weights in [0, 1).
+        """
+        theta_continuous = np.asarray(theta_continuous, dtype=float)
+        spacing = 2.0 * np.pi / n_theta
+        # grid[k] = -pi + k * spacing  ⇒  fractional index = (theta + pi) / spacing
+        idx_f = (theta_continuous + np.pi) / spacing
+        i0_float = np.floor(idx_f)
+        i0 = (i0_float.astype(np.intp)) % n_theta
+        i1 = (i0 + 1) % n_theta
+        w = idx_f - i0_float
+        return i0, i1, w
+
+    # ------------------------------------------------------------------
+    # Core methods — the single source of truth (discrete-grid θ)
     # ------------------------------------------------------------------
 
     def encode(
@@ -179,6 +232,10 @@ class Population:
         Encode a stimulus configuration into Poisson spike counts.
 
         Pipeline:  r_pre (Eq. 13) -> DN (Eq. 6) -> Poisson (Def. 4.5)
+
+        This is the DISCRETE-grid path: orientations are passed in as
+        integer indices into theta_grid. For the continuous-orientation
+        path used by run_trials(), see _interp_log_r_pre below.
 
         Parameters
         ----------
@@ -225,7 +282,7 @@ class Population:
         Returns
         -------
         theta_hat : float
-            ML orientation estimate.
+            ML orientation estimate (lives on theta_grid).
         L_marginal : np.ndarray, shape (n_theta,)
             Marginal log-likelihood curve.
         """
@@ -233,7 +290,7 @@ class Population:
         return ml_decode(spike_counts, f_per_loc, self.theta_grid, cued_location)
 
     # ------------------------------------------------------------------
-    # Vectorised batch trial runner
+    # Vectorised batch trial runner (continuous θ, interpolated tuning)
     # ------------------------------------------------------------------
 
     def run_trials(
@@ -252,19 +309,31 @@ class Population:
         """
         Run n_trials of encode → decode, return circular errors.
 
-        Vectorised implementation of the same pipeline as calling
-        encode() and decode() in a loop.  ~50-100× faster.
+        Continuous-θ trial engine. True orientations are sampled from
+        Uniform[-pi, pi) and the stored tuning curves are linearly
+        interpolated at those off-grid points. This eliminates the
+        error-quantization artefact that occurs when both encoding and
+        decoding share the same θ grid (see the uniq_GP / zero_GP /
+        min|e|_GP diagnostic in the figure-2 notebook).
+
+        The decoder grid itself stays at n_theta points — theta_hat is
+        still snapped to the grid — but the truth is continuous, so the
+        error θ_hat − θ_true is continuous and free of the delta-at-zero
+        spike that previously inflated kurtosis at low set sizes.
 
         Encode (vectorised over trials):
-            r_pre[n, t] = exp( Σ_k  f[n, locs[t,k], θ_idxs[t,k]] )   (Eq. 13)
-            r_pre[recruited, t] *= alpha                              (Fig 3 cue)
-            D[t]        = σ² + mean_n( r_pre[n, t] )
-            r_post[n,t] = γ · r_pre[n,t] / D[t]                       (Eq. 6)
-            counts[n,t] ~ Poisson( r_post[n,t] · T_d )                (Def. 4.5)
+            f(θ) ≈ (1-w_k)·f[loc, i0_k] + w_k·f[loc, i1_k]            (linear interp)
+            r_pre[n, t]  = exp( Σ_k  f_interp[n, locs[t,k], θ[t,k]] )  (Eq. 13)
+            r_pre[recruited, t] *= alpha                                (Fig 3 cue)
+            D[t]         = σ² + mean_n( r_pre[n, t] )
+            r_post[n, t] = γ · r_pre[n, t] / D[t]                       (Eq. 6)
+            counts[n, t] ~ Poisson( r_post[n, t] · T_d )                (Def. 4.5)
 
         Decode (vectorised over trials):
-            L_c[t, θ]  = Σ_n  counts[n,t] · f[n, cued_loc[t], θ]     (Eq. 23)
-            θ_hat[t]   = argmax_θ  L_c[t, θ]                          (Eq. 28)
+            L_c[t, θ] = Σ_n  counts[n, t] · f[n, cued_loc[t], θ]        (Eq. 23)
+            θ̂_idx[t] = argmax_θ  L_c[t, θ]                              (Eq. 28)
+            θ̂[t]     = theta_grid[θ̂_idx[t]]   (on-grid)
+            error[t] = wrap(θ̂[t] − θ_true[t])  (continuous truth)
 
         Note: The ML point estimate depends only on L_c — the logsumexp
         terms over non-cued locations are constant w.r.t. θ_c and do not
@@ -350,7 +419,12 @@ class Population:
             # argsort of uniform randoms gives a random permutation per row
             locs = rng.random((n_trials, L)).argsort(axis=1)[:, :l]
 
-        theta_idxs = rng.randint(n_theta, size=(n_trials, l))
+        # Continuous true orientations (Option A: no grid quantization).
+        # Previously this was rng.randint(n_theta, ...) which forced θ
+        # onto the same grid the decoder evaluates on — producing exact
+        # "θ_hat == θ_true" hits and a delta-at-zero in the error
+        # distribution that inflated kurtosis.
+        theta_true = rng.uniform(-np.pi, np.pi, size=(n_trials, l))   # (n_trials, l)
 
         # Cued-index resolution -------------------------------------------
         # `cued` is the index INTO each trial's `locs` row of the probed
@@ -370,14 +444,22 @@ class Population:
             cued = (np.zeros(n_trials, dtype=int) if l == 1
                     else rng.randint(l, size=n_trials))
 
-        # ---- 2. Vectorised encode ----
-        # r_pre[n, t] = exp( Σ_k f[n, locs[t,k], θ_idxs[t,k]] )
-        # f[:, locs[:, k], theta_idxs[:, k]] gathers shape (N, n_trials)
+        # ---- 2. Vectorised encode with linear interpolation ----
+        # For continuous θ at each (trial, location), find bracketing
+        # grid indices and weights, then read off both endpoints and
+        # blend. Equivalent to evaluating each neuron's tuning curve as
+        # a piecewise-linear function on the circle.
+        i0, i1, w = self._circular_linear_interp_indices(theta_true, n_theta)
+        # i0, i1: int (n_trials, l).  w: float (n_trials, l).
+
         log_r_pre = np.zeros((N, n_trials))
         for k in range(l):
-            log_r_pre += self.f[:, locs[:, k], theta_idxs[:, k]]
+            # Gather (N, n_trials) slices at the bracketing grid points.
+            f_left  = self.f[:, locs[:, k], i0[:, k]]    # (N, n_trials)
+            f_right = self.f[:, locs[:, k], i1[:, k]]    # (N, n_trials)
+            log_r_pre += (1.0 - w[:, k]) * f_left + w[:, k] * f_right
 
-        r_pre = np.exp(log_r_pre)                       # (N, n_trials)
+        r_pre = np.exp(log_r_pre)                        # (N, n_trials)
 
         # Recruitment boost: multiply selected neurons' drive by alpha
         # before DN. With recruited_mask=None and alpha=1.0 this is a no-op.
@@ -405,11 +487,15 @@ class Population:
 
         theta_hat_idx = np.argmax(L_c, axis=1)           # (n_trials,)
 
-        # ---- 4. Circular errors ----
-        theta_true = self.theta_grid[theta_idxs[np.arange(n_trials), cued]]
+        # ---- 4. Circular errors (continuous truth vs grid-snapped estimate) ----
+        # theta_true_probed is continuous; theta_hat lives on theta_grid.
+        # The (small) residual quantization here is bounded by the
+        # decoder grid spacing 2π/n_theta and is well below Poisson noise
+        # for any realistic parameter regime.
+        theta_true_probed = theta_true[np.arange(n_trials), cued]
         theta_hat = self.theta_grid[theta_hat_idx]
 
-        d = theta_hat - theta_true
+        d = theta_hat - theta_true_probed
         errors = (d + np.pi) % (2.0 * np.pi) - np.pi
 
         return errors
@@ -430,9 +516,10 @@ class Population:
         """
         Sequential (non-vectorised) trial loop — kept for validation.
 
-        Calls encode() and decode() per trial, exactly matching the
-        original implementation.  Use to verify that run_trials() gives
-        statistically equivalent results.
+        Uses the continuous-θ + interpolation pipeline to match
+        run_trials() (statistically; individual draws differ because
+        RNG consumption order differs). For the discrete-grid encode/decode
+        pipeline, use encode() and decode() directly.
         """
         if rng is None:
             rng = np.random.RandomState()
@@ -441,11 +528,27 @@ class Population:
 
         for t in range(n_trials):
             locs = tuple(rng.choice(self.L, size=set_size, replace=False))
-            theta_idxs = rng.randint(self.n_theta, size=set_size)
+            theta_true_per_loc = rng.uniform(-np.pi, np.pi, size=set_size)
             cued = rng.randint(set_size)
-            theta_true = self.theta_grid[theta_idxs[cued]]
+            theta_true = theta_true_per_loc[cued]
 
-            counts = self.encode(locs, theta_idxs, gamma, T_d, sigma_sq, rng)
+            # --- Continuous-θ encoding: interpolate f at each location ---
+            i0, i1, w = self._circular_linear_interp_indices(
+                theta_true_per_loc, self.n_theta
+            )
+            log_r_pre = np.zeros(self.N)
+            for k, loc in enumerate(locs):
+                f_left  = self.f[:, loc, i0[k]]
+                f_right = self.f[:, loc, i1[k]]
+                log_r_pre += (1.0 - w[k]) * f_left + w[k] * f_right
+            r_pre = np.exp(log_r_pre)
+
+            # DN + Poisson
+            D = sigma_sq + r_pre.mean()
+            r_post = gamma * r_pre / D
+            counts = rng.poisson(r_post * T_d)
+
+            # ML decode (factorised marginalisation) — grid-based as usual
             theta_hat, _ = self.decode(counts, locs, cued)
 
             errors[t] = circular_error(theta_true, theta_hat)
