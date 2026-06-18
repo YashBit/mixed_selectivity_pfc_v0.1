@@ -26,10 +26,10 @@ def periodic_rbf_kernel(
 ) -> np.ndarray:
     """
     Compute periodic RBF (squared exponential) kernel for circular orientation space.
-    
+
     The kernel is: k(θ_i, θ_j) = exp(-d²/(2λ²))
     where d is the circular distance: d = min(|θ_i - θ_j|, 2π - |θ_i - θ_j|)
-    
+
     Parameters
     ----------
     orientations : np.ndarray
@@ -38,23 +38,23 @@ def periodic_rbf_kernel(
         Lengthscale λ controlling tuning width (smaller = sharper tuning)
     jitter : float
         Small value added to diagonal for numerical stability
-        
+
     Returns
     -------
     K : np.ndarray
         Covariance matrix, shape (n_theta, n_theta)
     """
     n_theta = len(orientations)
-    
+
     # Vectorized computation
     theta_i, theta_j = np.meshgrid(orientations, orientations, indexing='ij')
     dist = np.abs(theta_i - theta_j)
     dist = np.minimum(dist, 2 * np.pi - dist)
     K = np.exp(-dist**2 / (2 * lengthscale**2))
-    
+
     # Add jitter for numerical stability
     K += jitter * np.eye(n_theta)
-    
+
     return K
 
 
@@ -64,18 +64,18 @@ def sample_gp_function(
 ) -> np.ndarray:
     """
     Sample a function from a Gaussian Process with covariance K.
-    
+
     Uses Cholesky decomposition with eigenvalue fallback for numerical stability:
     - Primary: f = L @ z where L = chol(K), z ~ N(0, I)
     - Fallback: f = V @ (sqrt(λ) * z) using eigendecomposition
-    
+
     Parameters
     ----------
     K : np.ndarray
         Covariance matrix, shape (n_theta, n_theta)
     random_state : np.random.RandomState
         Random state for reproducibility
-        
+
     Returns
     -------
     f : np.ndarray
@@ -83,7 +83,7 @@ def sample_gp_function(
     """
     n = K.shape[0]
     z = random_state.randn(n)
-    
+
     try:
         # Try Cholesky first (faster, more stable when it works)
         L = np.linalg.cholesky(K)
@@ -99,6 +99,12 @@ def sample_gp_function(
 # ============================================================================
 # LENGTHSCALE GENERATION
 # ============================================================================
+
+# Canonical method names accepted by `generate_location_dependent_lengthscales`.
+# `random_vector` is retained as a backward-compatible alias for `sparse_broad`.
+_VALID_METHODS = {"folded_normal", "gamma", "sparse_broad"}
+_METHOD_ALIASES = {"random_vector": "sparse_broad"}
+
 
 def generate_location_dependent_lengthscales(
     n_locations: int,
@@ -131,37 +137,38 @@ def generate_location_dependent_lengthscales(
         Natively defined on (0, ∞) — no folding required — giving a
         smooth, principled prior. I.i.d. across locations.
 
-    3. Random-Vector (`method="random_vector"`):
-        Non-i.i.d. two-component scheme. A small number of locations
-        (`n_high`, default 1) are designated "high" and drawn from a
+    3. Sparse-Broad (`method="sparse_broad"`, alias: `"random_vector"`):
+        Non-i.i.d. two-component scheme. A sparse subset of locations
+        (`n_high`, default 1) are designated "broad" and drawn from a
         Gaussian centred at `base_lengthscale * high_multiplier`; the
-        remaining locations are "low" and drawn from a Gaussian centred
-        at `base_lengthscale`. Both Gaussians use `variability` as
-        their std (in folded-Normal style: |1 + σ_λ · z|). The high
+        remaining locations are "sharp" and drawn from a Gaussian
+        centred at `base_lengthscale`. Both Gaussians use `variability`
+        as their std (in folded-Normal style: |1 + σ_λ · z|). The broad
         location(s) are chosen uniformly at random.
 
-        This creates structured asymmetry — most locations have sharp
-        tuning, with one (or a few) "broad" outlier locations — rather
-        than the symmetric heterogeneity of methods 1–2. The result is
-        a mixed-selective neuron with a dominant broad-tuning location.
+        When `n_high == 1` this reduces to a one-hot indicator over
+        locations selecting the unique broad-tuning slot; for
+        `n_high > 1` it is a k-hot generalisation. The result is a
+        mixed-selective neuron with a sparse set of dominant
+        broad-tuning locations — structured asymmetry instead of the
+        symmetric heterogeneity of methods 1–2.
 
     All three options break separability and create conjunctive (mixed)
-    selectivity, but the random-vector method produces a qualitatively
-    different population structure: asymmetric instead of symmetric
-    heterogeneity.
+    selectivity, but `sparse_broad` produces a qualitatively different
+    population structure: asymmetric instead of symmetric heterogeneity.
 
     Parameters
     ----------
     n_locations : int
         Number of spatial locations.
     base_lengthscale : float
-        Base lengthscale λ_base. Interpreted as the (low-component) mean
-        in all three methods.
+        Base lengthscale λ_base. Interpreted as the (sharp-component)
+        mean in all three methods.
     variability : float
         Variability parameter σ_λ controlling heterogeneity.
         - Folded-Normal: std of the underlying Normal before folding.
         - Gamma: target coefficient of variation (std/mean).
-        - Random-Vector: std of both component Gaussians (folded style).
+        - Sparse-Broad: std of both component Gaussians (folded style).
     random_state : np.random.RandomState
         Random state for reproducibility.
     use_gamma : bool, optional
@@ -170,15 +177,14 @@ def generate_location_dependent_lengthscales(
         Retained for backward compatibility.
     method : str or None, optional
         Sampling method. One of `"folded_normal"`, `"gamma"`,
-        `"random_vector"`. If None, falls back to `use_gamma` for
-        backward compatibility (`use_gamma=True` → `"gamma"`,
-        `use_gamma=False` → `"folded_normal"`).
+        `"sparse_broad"` (alias `"random_vector"`). If None, falls back
+        to `use_gamma` for backward compatibility.
     n_high : int, optional
-        Random-vector mode only. Number of "high" (broad-tuning)
-        locations. Default 1. Clamped to [0, n_locations].
+        Sparse-broad mode only. Number of "broad" locations per neuron.
+        Default 1. Clamped to [0, n_locations].
     high_multiplier : float, optional
-        Random-vector mode only. Multiplier on `base_lengthscale` that
-        sets the mean of the high-component Gaussian. Default 3.0.
+        Sparse-broad mode only. Multiplier on `base_lengthscale` that
+        sets the mean of the broad-component Gaussian. Default 3.0.
 
     Returns
     -------
@@ -189,6 +195,8 @@ def generate_location_dependent_lengthscales(
     if method is None:
         method = "gamma" if use_gamma else "folded_normal"
     method = method.lower()
+    # Apply alias resolution (e.g. legacy "random_vector" → "sparse_broad").
+    method = _METHOD_ALIASES.get(method, method)
 
     if method == "folded_normal":
         # I.i.d. folded-Normal: λ_i = λ_base · |1 + σ_λ · z_i|.
@@ -209,33 +217,34 @@ def generate_location_dependent_lengthscales(
                 shape=shape, scale=scale, size=n_locations
             )
 
-    elif method == "random_vector":
+    elif method == "sparse_broad":
         # Non-i.i.d. two-component scheme.
-        # `n_high` locations drawn from a Gaussian centred at the high mean;
-        # remaining locations drawn from a Gaussian centred at the low mean.
-        # Both use `variability` as std (folded-Normal style for positivity).
+        # A sparse `n_high`-subset of locations gets the broad-component mean;
+        # the rest get the sharp-component mean. Both use `variability` as
+        # std (folded-Normal style for positivity).
         n_high_eff = int(np.clip(n_high, 0, n_locations))
 
-        # Choose which locations are "high" uniformly at random (no replacement).
-        high_indices = random_state.choice(
+        # Choose which locations are "broad" uniformly at random (no replacement).
+        broad_indices = random_state.choice(
             n_locations, size=n_high_eff, replace=False
         )
-        is_high = np.zeros(n_locations, dtype=bool)
-        is_high[high_indices] = True
+        is_broad = np.zeros(n_locations, dtype=bool)
+        is_broad[broad_indices] = True
 
         # Sample folded-Normal factors and scale by component mean.
         z = random_state.randn(n_locations)
         factors = np.abs(1.0 + variability * z)
 
-        low_mean = base_lengthscale
-        high_mean = base_lengthscale * high_multiplier
+        sharp_mean = base_lengthscale
+        broad_mean = base_lengthscale * high_multiplier
 
-        lengthscales = np.where(is_high, high_mean, low_mean) * factors
+        lengthscales = np.where(is_broad, broad_mean, sharp_mean) * factors
 
     else:
         raise ValueError(
             f"Unknown method '{method}'. "
-            f"Expected one of: 'folded_normal', 'gamma', 'random_vector'."
+            f"Expected one of: 'folded_normal', 'gamma', 'sparse_broad' "
+            f"(alias 'random_vector')."
         )
 
     # Floor at 0.1 for numerical stability of the GP kernel.
@@ -261,13 +270,13 @@ def generate_neuron_tuning_curves(
 ) -> Dict:
     """
     Generate tuning curves for a single neuron across all locations.
-    
+
     For each location, we:
     1. Generate a location-specific lengthscale
     2. Build the covariance matrix with that lengthscale
     3. Sample a GP function (log-rate)
     4. Apply random gain modulation
-    
+
     Parameters
     ----------
     n_orientations : int
@@ -287,14 +296,15 @@ def generate_neuron_tuning_curves(
         `generate_location_dependent_lengthscales`.
     method : str or None, optional
         Lengthscale sampling method: `"folded_normal"`, `"gamma"`, or
-        `"random_vector"`. If None, falls back to `use_gamma`.
+        `"sparse_broad"` (alias `"random_vector"`). If None, falls back
+        to `use_gamma`.
     n_high : int, optional
-        Random-vector method only. Number of "high" (broad-tuning)
-        locations. Default 1.
+        Sparse-broad method only. Number of "broad" locations.
+        Default 1.
     high_multiplier : float, optional
-        Random-vector method only. Multiplier on `base_lengthscale`
-        setting the high-component mean. Default 3.0.
-        
+        Sparse-broad method only. Multiplier on `base_lengthscale`
+        setting the broad-component mean. Default 3.0.
+
     Returns
     -------
     dict with:
@@ -309,7 +319,7 @@ def generate_neuron_tuning_curves(
     """
     # Create orientation grid
     orientations = np.linspace(-np.pi, np.pi, n_orientations, endpoint=False)
-    
+
     # Generate location-dependent lengthscales
     lengthscales = generate_location_dependent_lengthscales(
         n_locations, base_lengthscale, lengthscale_variability, random_state,
@@ -318,23 +328,23 @@ def generate_neuron_tuning_curves(
         n_high=n_high,
         high_multiplier=high_multiplier,
     )
-    
+
     # Sample GP functions for each location
     f_samples = np.zeros((n_locations, n_orientations))
     gains = np.zeros(n_locations)
-    
+
     for loc in range(n_locations):
         # Build kernel with this location's lengthscale
         K = periodic_rbf_kernel(orientations, lengthscales[loc])
-        
+
         # Sample GP function (with robust fallback)
         f_loc = sample_gp_function(K, random_state)
-        
+
         # Apply gain modulation
         gain = np.abs(1.0 + gain_variability * random_state.randn())
         gains[loc] = gain
         f_samples[loc, :] = f_loc * gain
-    
+
     return {
         'f_samples': f_samples,
         'lengthscales': lengthscales,
@@ -358,10 +368,10 @@ def generate_neuron_population(
 ) -> List[Dict]:
     """
     Generate a population of neurons with mixed selectivity.
-    
+
     Each neuron gets its own random lengthscales, creating population
     heterogeneity that is characteristic of prefrontal cortex.
-    
+
     Parameters
     ----------
     n_neurons : int
@@ -383,14 +393,15 @@ def generate_neuron_population(
         `generate_location_dependent_lengthscales`.
     method : str or None, optional
         Lengthscale sampling method: `"folded_normal"`, `"gamma"`, or
-        `"random_vector"`. If None, falls back to `use_gamma`.
+        `"sparse_broad"` (alias `"random_vector"`). If None, falls back
+        to `use_gamma`.
     n_high : int, optional
-        Random-vector method only. Number of "high" (broad-tuning)
-        locations per neuron. Default 1.
+        Sparse-broad method only. Number of "broad" locations per
+        neuron. Default 1.
     high_multiplier : float, optional
-        Random-vector method only. Multiplier on `base_lengthscale`
-        setting the high-component mean. Default 3.0.
-        
+        Sparse-broad method only. Multiplier on `base_lengthscale`
+        setting the broad-component mean. Default 3.0.
+
     Returns
     -------
     population : List[Dict]
@@ -398,12 +409,12 @@ def generate_neuron_population(
     """
     master_rng = np.random.RandomState(seed)
     population = []
-    
+
     for neuron_idx in range(n_neurons):
         # Each neuron gets its own random state (derived from master)
         neuron_seed = master_rng.randint(0, 2**31)
         neuron_rng = np.random.RandomState(neuron_seed)
-        
+
         neuron_data = generate_neuron_tuning_curves(
             n_orientations=n_orientations,
             n_locations=n_locations,
@@ -418,9 +429,9 @@ def generate_neuron_population(
         )
         neuron_data['neuron_idx'] = neuron_idx
         neuron_data['seed'] = neuron_seed
-        
+
         population.append(neuron_data)
-    
+
     return population
 
 
@@ -434,19 +445,19 @@ def compute_log_rate_tensor(
 ) -> np.ndarray:
     """
     Compute the log-rate tensor G for a subset of locations.
-    
+
     G(θ_1, ..., θ_l) = Σ_k f_k(θ_k)
-    
+
     This is the additive combination in log-space, which becomes
     multiplicative in rate-space after exponentiation.
-    
+
     Parameters
     ----------
     f_samples : np.ndarray
         Log-rate tuning functions, shape (n_locations, n_orientations)
     subset : Tuple[int, ...]
         Indices of active locations
-        
+
     Returns
     -------
     G : np.ndarray
@@ -454,16 +465,16 @@ def compute_log_rate_tensor(
     """
     n_theta = f_samples.shape[1]
     l = len(subset)
-    
+
     # Initialize l-dimensional tensor
     G = np.zeros([n_theta] * l)
-    
+
     # Add each location's contribution along its dimension
     for dim_idx, loc in enumerate(subset):
         shape = [1] * l
         shape[dim_idx] = n_theta
         G = G + f_samples[loc, :].reshape(shape)
-    
+
     return G
 
 
@@ -473,14 +484,14 @@ def compute_pre_normalized_response(
 ) -> np.ndarray:
     """
     Compute pre-normalized response R = exp(G) for a subset.
-    
+
     Parameters
     ----------
     f_samples : np.ndarray
         Log-rate tuning functions
     subset : Tuple[int, ...]
         Active location indices
-        
+
     Returns
     -------
     R_pre : np.ndarray
@@ -493,14 +504,14 @@ def compute_pre_normalized_response(
 def compute_driving_input(f_samples: np.ndarray) -> np.ndarray:
     """
     Compute driving input g = exp(f) for all locations.
-    
+
     This is the quantity that enters the DN denominator.
-    
+
     Parameters
     ----------
     f_samples : np.ndarray
         Log-rate tuning functions, shape (n_locations, n_orientations)
-        
+
     Returns
     -------
     g : np.ndarray
@@ -512,14 +523,14 @@ def compute_driving_input(f_samples: np.ndarray) -> np.ndarray:
 def compute_mean_driving_input(f_samples: np.ndarray) -> np.ndarray:
     """
     Compute mean driving input ḡ_j = mean_θ[exp(f_j(θ))] for each location.
-    
+
     This is what enters the DN denominator in Bays (2014).
-    
+
     Parameters
     ----------
     f_samples : np.ndarray
         Log-rate tuning functions, shape (n_locations, n_orientations)
-        
+
     Returns
     -------
     g_bar : np.ndarray
