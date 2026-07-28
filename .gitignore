@@ -1,1 +1,48 @@
-venv/*
+# ── Virtual environments ──────────────────────────────────────────────
+venv/
+.venv/
+env/
+ENV/
+
+# ── Python bytecode / build cruft ─────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# ── Personal notes ────────────────────────────────────────────────────
+notes.txt
+**/notes.txt
+
+# ── Generated results (anywhere in the tree) ──────────────────────────
+result_data/
+**/result_data/
+results/
+**/results/
+
+# ── Simulation / data caches (anywhere in the tree) ───────────────────
+_sim_cache/
+**/_sim_cache/
+bays_cache/
+**/bays_cache/
+cached_data/
+**/cached_data/
+*.npz
+
+# ── Logs ──────────────────────────────────────────────────────────────
+*.log
+logs/
+**/logs/
+
+# ── Jupyter ───────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+**/.ipynb_checkpoints/
+
+# ── OS / editor junk ──────────────────────────────────────────────────
+.DS_Store
+*.swp
+.idea/
+.vscode/

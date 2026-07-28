@@ -1,0 +1,29 @@
+1. Hubel and Wiesel -> Do not require its own subsection.
+    1. Retinotopy - Early visual areas - Paul's Model is Justified, as long as you think that the memory is kept in Visual Cortex. PFC does not have the - 
+    working memory in PFC. Neurons in PFC do not have Retinotopy and pure selectivity, locus of memory was in PFC, mixed selective tuning curves. 
+    One Motivation - What if memory is held in PFC? Then Bays' model becomes
+    Second - DN in Bays model acts cleanly - the one that is queried - in his model you only look at one subpopulations - others are ignorant. 
+    Which subset of neurons to look for, DN -> divides the sub-population -> 1/l. 
+
+    Signal to Noise. 
+    What is the same in both cases is that the total firing rate of the entire network is constant firing rate.
+    DN -> Bays -> Decode from sub-population -> The total firing rate of the decoded population (sub-population selective to the queried location) decreases with set 
+    size (1/l)
+    DN -> GP -> Decode from entire population -> The total firing rate of the decoded population (entire population) does not change with set size.
+
+
+    2. Dayan & Abbott 
+2. Print the kurtosis arrays from GP and Bays model. 
+3. For Figure 2 -> Cell #31 
+Isolate and print the errors -> 2 arrays 
+    1. Apply Von Mises KDE
+    2. Circular_Kurtosis_Fisher
+    3. Plot the Density
+    4. Print the two values of Kurtosis 
+    5. Plot the histograms and the KDE.
+    6. The fraction which is zero. 
+4. Smooth hyperparameter - play with it and see the plots
+
+
+5. Bays - 2024 Figure:
+    1. Use same fitted-parameters as Figure 2 in GP data. 
