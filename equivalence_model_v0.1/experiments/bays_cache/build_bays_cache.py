@@ -78,7 +78,12 @@ import numpy as np
 OMEGA          = 0.52                  # tuning width  (Bays Eq. 1)
 GAMMA_TOTAL    = 119.0                 # total population gain, Hz  (Bays Eq. 3)
 T_D            = 0.1                   # decoding window, seconds  (Bays Eq. 4)
-SET_SIZES      = [1, 2, 4, 8]          # set sizes to sample
+SET_SIZES      = list(range(1, 9))     # set sizes to sample: 1,2,3,4,5,6,7,8
+                                       # (was [1, 2, 4, 8]; widened to the full
+                                       #  1-8 sweep. NOTE: the filename schema does
+                                       #  NOT encode set sizes, so rebuild existing
+                                       #  caches with --force to overwrite the old
+                                       #  4-size file with this 8-size one.)
 SEED           = 12345                 # base RNG seed
 N_DECODE_GRID  = 1000                  # ML decoder evaluation grid points
 

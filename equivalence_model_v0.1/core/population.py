@@ -45,7 +45,207 @@ from typing import Tuple, Optional
 from core.encoder.gaussian_process import generate_neuron_population
 from core.encoder.divisive_normalization import dn_pointwise, compute_r_pre_at_config
 from core.encoder.poisson_spike import generate_spikes, generate_spikes_multi_trial
-from core.decoder.ml_decoder import decode as ml_decode, circular_error
+from core.decoder.ml_decoder import decode as ml_decode
+
+# The circular error metrics now live in the central metrics module
+# (metrics.py) as the single source of truth. circular_error (the per-trial
+# signed decoder error) is imported here because run_multiloc_trials and
+# Population.run_trials consume it; circular_variance_fisher /
+# circular_kurtosis_fisher are used only by the notebooks, which import them
+# from core.metrics directly.
+from core.metrics import circular_error
+
+
+# ============================================================================
+# Vectorised multi-location trial engine (continuous-theta encoding)
+# ============================================================================
+# True orientations are drawn from Uniform[-pi, pi) and the stored tuning
+# curves are linearly interpolated at those off-grid points, avoiding the
+# error-distribution quantization artefact that arises when truth and decoder
+# both live on the same grid. This is the module-level engine the notebooks
+# import directly (the Population.run_trials method is the OOP equivalent).
+
+def _circular_linear_interp_indices(theta_continuous, n_theta):
+    """
+    Bracketing-grid indices and weights for linear interpolation of a
+    function tabulated on the circular grid
+
+        grid = np.linspace(-pi, pi, n_theta, endpoint=False)
+
+    at continuous theta values. Returns (i0, i1, w) where
+    f(theta) ~= (1 - w) * f[grid[i0]] + w * f[grid[i1]].
+    """
+    theta_continuous = np.asarray(theta_continuous, dtype=float)
+    spacing = 2.0 * np.pi / n_theta
+    idx_f = (theta_continuous + np.pi) / spacing
+    i0_float = np.floor(idx_f)
+    i0 = i0_float.astype(np.intp) % n_theta
+    i1 = (i0 + 1) % n_theta
+    w = idx_f - i0_float
+    return i0, i1, w
+
+
+def run_multiloc_trials(f_all, thetas, active_locs, cued_index,
+                        gamma, T_d, sigma_sq, n_trials, rng, batch_size=1000):
+    """
+    Vectorised multi-location trial engine.
+
+    Encoding and spiking are vectorised across batches; decoding goes through
+    core.decoder.ml_decoder.decode(); per-trial error uses circular_error
+    (defined above).
+
+    Parameters
+    ----------
+    f_all : list of np.ndarray
+        One (M, n_theta) log-tuning array per location.
+    thetas : np.ndarray, shape (n_theta,)
+        Decoder orientation grid.
+    active_locs : tuple of int
+        Indices into f_all that carry an item this run.
+    cued_index : int
+        Index *into active_locs* of the probed item.
+    gamma, T_d, sigma_sq : float
+        Per-neuron gain (Hz), decoding window (s), semi-saturation constant.
+    n_trials : int
+    rng : np.random.RandomState
+    batch_size : int
+    """
+    n_locs = len(active_locs)
+    M_neurons, n_theta = f_all[0].shape
+    f_active = [f_all[loc] for loc in active_locs]
+    errors = np.empty(n_trials)
+
+    # Continuous true orientations (no encoding-grid quantization).
+    all_theta_continuous = rng.uniform(-np.pi, np.pi, size=(n_trials, n_locs))
+    all_i0, all_i1, all_w = _circular_linear_interp_indices(
+        all_theta_continuous, n_theta
+    )
+
+    for start in range(0, n_trials, batch_size):
+        end = min(start + batch_size, n_trials)
+        B = end - start
+        i0_b = all_i0[start:end]
+        i1_b = all_i1[start:end]
+        w_b = all_w[start:end]
+
+        # Linear interpolation between bracketing grid points.
+        log_r_pre = np.zeros((M_neurons, B))
+        for k in range(n_locs):
+            f_left = f_active[k][:, i0_b[:, k]]
+            f_right = f_active[k][:, i1_b[:, k]]
+            log_r_pre += (1.0 - w_b[:, k]) * f_left + w_b[:, k] * f_right
+        r_pre = np.exp(log_r_pre)
+
+        # Divisive normalization.
+        D = sigma_sq + np.mean(r_pre, axis=0)
+        rates = gamma * r_pre / D[np.newaxis, :]
+
+        # Poisson spikes.
+        counts = rng.poisson(rates * T_d)
+
+        # Per-trial decoding via the core ML decoder (grid-based).
+        for b in range(B):
+            n_vec = counts[:, b]
+            theta_hat, _ = ml_decode(n_vec, f_active, thetas, cued_index)
+            theta_true = all_theta_continuous[start + b, cued_index]
+            errors[start + b] = circular_error(theta_true, theta_hat)
+
+    return errors
+
+
+# ============================================================================
+# Bays (2014) parametric model — Experiment 2 (informative cue)
+# ============================================================================
+# Verbatim NumPy port of the Bays cued-recall pipeline (Eqs. 1, 2/3, 4, 8),
+# extended from the uncued Experiment-1 engine (build_bays_cache.py) with the
+# attentional gain factor alpha_cued on the cued location. This is the same
+# parametric model used for the uncued reference; here the cued location gets
+# a multiplicative gain in the divisive-normalization denominator, which is
+# the mechanism that produces the cued/uncued precision asymmetry. numpy only.
+
+def bays_run_trials_cued(n_trials, set_size, omega, gamma_total, T_d,
+                         alpha_cued, cued_probe_ratio=3.0,
+                         M_bays=100, rng=None, n_decode_grid=1000):
+    """Bays (2014) Experiment-2 cued-recall trial runner.
+
+    Differences from the uncued Experiment-1 engine:
+      (i)   one location (index 0) receives alpha_cued; all others alpha = 1.
+      (ii)  the DN denominator sums alpha_n * f_mn over the (l, M) matrix, so
+            boosting the cued item steals normalized activity from the uncued
+            items — this is the entire asymmetry mechanism.
+      (iii) the probe lands on the cued item with probability
+            c / (c + l - 1), c = cued_probe_ratio (Bays Materials & Methods).
+      (iv)  returns errors AND a boolean mask marking cued-probe trials, so the
+            caller can split cued vs uncued after the fact.
+
+    Parameters
+    ----------
+    n_trials : int
+    set_size : int                 number of active locations, l
+    omega : float                  Bays tuning width (Eq. 1)
+    gamma_total : float            total population gain, Hz (Eq. 3)
+    T_d : float                    decoding window, s (Eq. 4)
+    alpha_cued : float             attentional gain on location 0 (> 1)
+    cued_probe_ratio : float       cued:uncued test-probability ratio (c)
+    M_bays : int                   number of Bays neurons
+    rng : np.random.RandomState or None
+    n_decode_grid : int            ML-decoder evaluation grid points (Eq. 8)
+
+    Returns
+    -------
+    errors : np.ndarray, shape (n_trials,)
+        Signed circular errors in [-pi, pi).
+    probe_is_cued : np.ndarray of bool, shape (n_trials,)
+        True on trials where the cued item (location 0) was probed.
+    """
+    if rng is None:
+        rng = np.random.RandomState()
+
+    l = set_size
+    phi = np.linspace(-np.pi, np.pi, M_bays, endpoint=False)          # (M,)
+
+    # Continuous true orientations, one per active location.
+    theta_true = rng.uniform(-np.pi, np.pi, size=(n_trials, l))       # (T, l)
+
+    # Per-location attentional gain: location 0 cued, the rest at unity.
+    alphas = np.ones((n_trials, l))
+    alphas[:, 0] = alpha_cued
+
+    # Biased probe selection: cued with prob c / (c + l - 1).
+    p_cued = cued_probe_ratio / (cued_probe_ratio + (l - 1))
+    probe_is_cued = rng.random(n_trials) < p_cued
+    probed = np.empty(n_trials, dtype=int)
+    probed[probe_is_cued] = 0
+    n_unc = int((~probe_is_cued).sum())
+    if n_unc > 0:
+        probed[~probe_is_cued] = rng.randint(1, l, size=n_unc)
+
+    # Eq. 1: driving inputs at the continuous true orientations.
+    diff = phi[None, None, :] - theta_true[:, :, None]               # (T, l, M)
+    f = np.exp((1.0 / omega) * (np.cos(diff) - 1.0))                 # (T, l, M)
+
+    # Eq. 2/3: alpha-weighted divisive normalization over the (l, M) matrix.
+    f_w = alphas[:, :, None] * f                                     # (T, l, M)
+    denom = f_w.sum(axis=(1, 2))                                     # (T,)
+    rates = gamma_total * f_w / denom[:, None, None]                 # (T, l, M)
+
+    # Eq. 4: independent Poisson spikes; pull out the probed subpopulation.
+    counts = rng.poisson(rates * T_d)                               # (T, l, M)
+    counts_probed = counts[np.arange(n_trials), probed, :]          # (T, M)
+
+    # Eq. 8: ML decode on an n_decode_grid grid, random tie-breaking.
+    theta_eval = np.linspace(-np.pi, np.pi, n_decode_grid, endpoint=False)
+    cos_grid = np.cos(phi[:, None] - theta_eval[None, :])           # (M, n_grid)
+    objective = counts_probed @ cos_grid                            # (T, n_grid)
+    max_vals = objective.max(axis=1, keepdims=True)
+    tied_mask = objective >= max_vals - 1e-12
+    keys = rng.random(objective.shape) * tied_mask
+    theta_hat = theta_eval[keys.argmax(axis=1)]                     # (T,)
+
+    # Signed circular error in [-pi, pi).
+    d = theta_hat - theta_true[np.arange(n_trials), probed]
+    errors = (d + np.pi) % (2.0 * np.pi) - np.pi
+    return errors, probe_is_cued
 
 
 class Population:
@@ -130,14 +330,21 @@ class Population:
         n_high: int = 1,
         high_multiplier: float = 3.0,
     ):
-        if tuning_type not in ("bays", "gp"):
-            raise ValueError(f"tuning_type must be 'bays' or 'gp', got '{tuning_type}'")
+        if tuning_type not in ("bays", "gp", "vm"):
+            raise ValueError(
+                f"tuning_type must be 'bays', 'gp' or 'vm', got '{tuning_type}'")
 
         self.tuning_type = tuning_type
         self.omega = omega
 
         if tuning_type == "bays":
             f, theta_grid = self._build_bays(M, n_theta, omega)
+        elif tuning_type == "vm":
+            f, theta_grid = self._build_vm(
+                M, n_theta, omega, n_locations, seed,
+                lengthscale_variability, gain_variability, method,
+                n_high=n_high, high_multiplier=high_multiplier,
+            )
         else:
             f, theta_grid = self._build_gp(
                 M, n_theta, omega, n_locations, seed,
@@ -158,12 +365,62 @@ class Population:
 
     @staticmethod
     def _build_bays(M, n_theta, omega):
-        """Bays (2014) Eq. 1: f_i(theta) = (1/omega)(cos(phi_i - theta) - 1)"""
-        theta_grid = np.linspace(-np.pi, np.pi, n_theta, endpoint=False)
-        phi = np.linspace(-np.pi, np.pi, M, endpoint=False)
-        diff = phi[:, None] - theta_grid[None, :]
-        f = (1.0 / omega) * (np.cos(diff) - 1.0)
-        return f[:, np.newaxis, :], theta_grid     # (M, 1, n_theta)
+        """Bays (2014) Eq. 1 homogeneous population.
+
+        The model itself now lives in core.encoder.gaussian_process
+        (model='bays'); this method just executes it and reshapes the result
+        into the (M, 1, n_theta) layout the Population class expects. The
+        'bays' generator uses evenly spaced preferred orientations across the
+        population and the same curve at its single location, exactly matching
+        the previous inline f_i(theta) = (1/omega)(cos(phi_i - theta) - 1).
+        """
+        raw = generate_neuron_population(
+            n_neurons=M,
+            n_orientations=n_theta,
+            n_locations=1,
+            base_lengthscale=omega,
+            lengthscale_variability=0.0,
+            seed=0,               # unused by the deterministic Bays path
+            model="bays",
+            omega=omega,
+        )
+        theta_grid = raw[0]["orientations"]
+        f = np.zeros((M, 1, n_theta))
+        for n in range(M):
+            f[n] = raw[n]["f_samples"]
+        return f, theta_grid     # (M, 1, n_theta)
+
+    @staticmethod
+    def _build_vm(M, n_theta, omega, n_locations, seed,
+                  lengthscale_variability, gain_variability,
+                  method="folded_normal",
+                  n_high=1, high_multiplier=3.0):
+        """Von Mises tuning: each neuron gets a uniform preferred orientation
+        per location and a per-location width drawn from the chosen sampler
+        (folded_normal / gamma / sparse_sharp). The model itself lives in
+        core.encoder.gaussian_process (model='vm'); unlike the GP path the
+        width is `omega` directly (not sqrt(omega)). Returns the same
+        (M, n_locations, n_theta) layout as the GP builder.
+        """
+        raw = generate_neuron_population(
+            n_neurons=M,
+            n_orientations=n_theta,
+            n_locations=n_locations,
+            base_lengthscale=omega,          # vm: width is omega directly
+            lengthscale_variability=lengthscale_variability,
+            seed=seed,
+            gain_variability=gain_variability,
+            method=method,
+            n_high=n_high,
+            high_multiplier=high_multiplier,
+            model="vm",
+            omega=omega,
+        )
+        theta_grid = raw[0]["orientations"]
+        f = np.zeros((M, n_locations, n_theta))
+        for n in range(M):
+            f[n] = raw[n]["f_samples"]
+        return f, theta_grid
 
     @staticmethod
     def _build_gp(M, n_theta, omega, n_locations, seed,
